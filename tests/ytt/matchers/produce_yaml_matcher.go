@@ -12,7 +12,11 @@ import (
 	"github.com/onsi/gomega/gexec"
 	"github.com/onsi/gomega/types"
 
-	"k8s.io/client-go/kubernetes/scheme"
+	networkingv1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	networkingv1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
+	securityv1beta1 "istio.io/client-go/pkg/apis/security/v1beta1"
+	apiextensionsv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	scheme "k8s.io/client-go/kubernetes/scheme"
 )
 
 type ProduceYAMLMatcher struct {
@@ -82,6 +86,11 @@ func renderWithData(templates []string, data map[string]string) (*gexec.Session,
 }
 
 func parseYAML(yaml *gbytes.Buffer) (interface{}, error) {
+	apiextensionsv1beta1.AddToScheme(scheme.Scheme)
+	networkingv1alpha3.AddToScheme(scheme.Scheme)
+	networkingv1beta1.AddToScheme(scheme.Scheme)
+	securityv1beta1.AddToScheme(scheme.Scheme)
+
 	// TODO: Look at extending UniversalDeserializer Scheme with CRDs.
 	decode := scheme.Codecs.UniversalDeserializer().Decode
 

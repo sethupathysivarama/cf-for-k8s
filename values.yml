@@ -1,0 +1,17 @@
+#@data/values
+---
+system_certificate:
+  key: "foo"
+  crt: "bar"
+
+workloads_certificate:
+  key: "foo"
+  crt: "bar"
+
+system_domain: "foo.bar"
+app_domains: ["apps.foo.bar"]
+
+system_namespace: "foo"
+workloads_namespace: "bar"
+
+istio_static_ip:
