@@ -3,8 +3,568 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   labels:
+    app: prometheus
+    cloudfoundry.org/istio_version: 1.6.9
+    release: istio
+  name: prometheus-istio-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  - services
+  - endpoints
+  - pods
+  - nodes/proxy
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+- nonResourceURLs:
+  - /metrics
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app: prometheus
+    cloudfoundry.org/istio_version: 1.6.9
+    release: istio
+  name: prometheus-istio-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-istio-system
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: istio-system
+---
+apiVersion: v1
+data:
+  prometheus.yml: |-
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+    # Mixer scrapping. Defaults to Prometheus and mixer on same namespace.
+    - job_name: 'istio-mesh'
+      kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+          - istio-system
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: istio-telemetry;prometheus
+
+    # Scrape config for envoy stats
+    - job_name: 'envoy-stats'
+      metrics_path: /stats/prometheus
+      kubernetes_sd_configs:
+      - role: pod
+
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        action: keep
+        regex: '.*-envoy-prom'
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:15090
+        target_label: __address__
+      - action: labeldrop
+        regex: __meta_kubernetes_pod_label_(.+)
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod_name
+
+    - job_name: 'istio-policy'
+      kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+          - istio-system
+
+
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: istio-policy;http-policy-monitoring
+
+    - job_name: 'istio-telemetry'
+      kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+          - istio-system
+
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: istio-telemetry;http-monitoring
+
+    - job_name: 'pilot'
+      kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+          - istio-system
+
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: istiod;http-monitoring
+      - source_labels: [__meta_kubernetes_service_label_app]
+        target_label: app
+    - job_name: 'galley'
+      kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+          - istio-system
+
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: istio-galley;http-monitoring
+
+    - job_name: 'citadel'
+      kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+          - istio-system
+
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: istio-citadel;http-monitoring
+
+    - job_name: 'sidecar-injector'
+
+      kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+          - istio-system
+
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: istio-sidecar-injector;http-monitoring
+
+    # scrape config for API servers
+    - job_name: 'kubernetes-apiservers'
+      kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+          - default
+      scheme: https
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: kubernetes;https
+
+    # scrape config for nodes (kubelet)
+    - job_name: 'kubernetes-nodes'
+      scheme: https
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      kubernetes_sd_configs:
+      - role: node
+      relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/${1}/proxy/metrics
+
+    # Scrape config for Kubelet cAdvisor.
+    #
+    # This is required for Kubernetes 1.7.3 and later, where cAdvisor metrics
+    # (those whose names begin with 'container_') have been removed from the
+    # Kubelet metrics endpoint.  This job scrapes the cAdvisor endpoint to
+    # retrieve those metrics.
+    #
+    # In Kubernetes 1.7.0-1.7.2, these metrics are only exposed on the cAdvisor
+    # HTTP endpoint; use "replacement: /api/v1/nodes/${1}:4194/proxy/metrics"
+    # in that case (and ensure cAdvisor's HTTP server hasn't been disabled with
+    # the --cadvisor-port=0 Kubelet flag).
+    #
+    # This job is not necessary and should be removed in Kubernetes 1.6 and
+    # earlier versions, or it will cause the metrics to be scraped twice.
+    - job_name: 'kubernetes-cadvisor'
+      scheme: https
+      tls_config:
+        ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+      kubernetes_sd_configs:
+      - role: node
+      relabel_configs:
+      - action: labelmap
+        regex: __meta_kubernetes_node_label_(.+)
+      - target_label: __address__
+        replacement: kubernetes.default.svc:443
+      - source_labels: [__meta_kubernetes_node_name]
+        regex: (.+)
+        target_label: __metrics_path__
+        replacement: /api/v1/nodes/${1}/proxy/metrics/cadvisor
+
+    # scrape config for service endpoints.
+    - job_name: 'kubernetes-service-endpoints'
+      kubernetes_sd_configs:
+      - role: endpoints
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+        action: replace
+        target_label: __scheme__
+        regex: (https?)
+      - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+        action: replace
+        target_label: __address__
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+      - action: labelmap
+        regex: __meta_kubernetes_service_label_(.+)
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: kubernetes_namespace
+      - source_labels: [__meta_kubernetes_service_name]
+        action: replace
+        target_label: kubernetes_name
+
+    - job_name: 'kubernetes-pods'
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:  # If first two labels are present, pod should be scraped  by the istio-secure job.
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      - source_labels: [__meta_kubernetes_pod_annotation_sidecar_istio_io_status]
+        action: drop
+        regex: (.+)
+      - source_labels: [__meta_kubernetes_pod_annotation_istio_mtls]
+        action: drop
+        regex: (true)
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod_name
+    - job_name: 'kubernetes-pods-istio-secure'
+      scheme: https
+      tls_config:
+        ca_file: /etc/istio-certs/root-cert.pem
+        cert_file: /etc/istio-certs/cert-chain.pem
+        key_file: /etc/istio-certs/key.pem
+        insecure_skip_verify: true  # prometheus does not support secure naming.
+      kubernetes_sd_configs:
+      - role: pod
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: true
+      # sidecar status annotation is added by sidecar injector and
+      # istio_workload_mtls_ability can be specifically placed on a pod to indicate its ability to receive mtls traffic.
+      - source_labels: [__meta_kubernetes_pod_annotation_sidecar_istio_io_status, __meta_kubernetes_pod_annotation_istio_mtls]
+        action: keep
+        regex: (([^;]+);([^;]*))|(([^;]*);(true))
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: (.+)
+      - source_labels: [__address__]  # Only keep address that is host:port
+        action: keep    # otherwise an extra target with ':443' is added for https scheme
+        regex: ([^:]+):(\d+)
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: ([^:]+)(?::\d+)?;(\d+)
+        replacement: $1:$2
+        target_label: __address__
+      - action: labelmap
+        regex: __meta_kubernetes_pod_label_(.+)
+      - source_labels: [__meta_kubernetes_namespace]
+        action: replace
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: pod_name
+kind: ConfigMap
+metadata:
+  labels:
+    app: prometheus
+    cloudfoundry.org/istio_version: 1.6.9
+    release: istio
+  name: prometheus
+  namespace: istio-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    kbld.k14s.io/images: |
+      - Metas:
+        - Tag: 1.6.9
+          Type: resolved
+          URL: gcr.io/cf-routing/proxyv2:1.6.9
+        URL: gcr.io/cf-routing/proxyv2@sha256:7ab643e8d1765c6385a3fb3dbab0055f99894256ef2c4d29584b0480e5297ffd
+      - Metas:
+        - Tag: v2.15.1
+          Type: resolved
+          URL: docker.io/prom/prometheus:v2.15.1
+        URL: index.docker.io/prom/prometheus@sha256:169b743ceb4452266915272f9c3409d36972e41cb52f3f28644e6c0609fc54e6
+  labels:
+    app: prometheus
+    cloudfoundry.org/istio_version: 1.6.9
+    release: istio
+  name: prometheus
+  namespace: istio-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+      labels:
+        app: prometheus
+        cloudfoundry.org/istio_version: 1.6.9
+        release: istio
+    spec:
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - preference:
+              matchExpressions:
+              - key: beta.kubernetes.io/arch
+                operator: In
+                values:
+                - amd64
+            weight: 2
+          - preference:
+              matchExpressions:
+              - key: beta.kubernetes.io/arch
+                operator: In
+                values:
+                - ppc64le
+            weight: 2
+          - preference:
+              matchExpressions:
+              - key: beta.kubernetes.io/arch
+                operator: In
+                values:
+                - s390x
+            weight: 2
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: beta.kubernetes.io/arch
+                operator: In
+                values:
+                - amd64
+                - ppc64le
+                - s390x
+      containers:
+      - args:
+        - --storage.tsdb.retention=6h
+        - --config.file=/etc/prometheus/prometheus.yml
+        image: index.docker.io/prom/prometheus@sha256:169b743ceb4452266915272f9c3409d36972e41cb52f3f28644e6c0609fc54e6
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: 9090
+        name: prometheus
+        ports:
+        - containerPort: 9090
+          name: http
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9090
+        resources:
+          requests:
+            cpu: 10m
+        volumeMounts:
+        - mountPath: /etc/prometheus
+          name: config-volume
+        - mountPath: /etc/istio-certs
+          name: istio-certs
+      - args:
+        - proxy
+        - sidecar
+        - --domain
+        - $(POD_NAMESPACE).svc.cluster.local
+        - istio-proxy-prometheus
+        - --proxyLogLevel=warning
+        - --proxyComponentLogLevel=misc:error
+        - --controlPlaneAuthPolicy
+        - NONE
+        - --trust-domain=cluster.local
+        env:
+        - name: OUTPUT_CERTS
+          value: /etc/istio-certs
+        - name: JWT_POLICY
+          value: third-party-jwt
+        - name: PILOT_CERT_PROVIDER
+          value: istiod
+        - name: CA_ADDR
+          value: istiod.istio-system.svc:15012
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: INSTANCE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: SERVICE_ACCOUNT
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.serviceAccountName
+        - name: HOST_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: ISTIO_META_MESH_ID
+          value: cluster.local
+        - name: ISTIO_META_CLUSTER_ID
+          value: Kubernetes
+        image: gcr.io/cf-routing/proxyv2@sha256:7ab643e8d1765c6385a3fb3dbab0055f99894256ef2c4d29584b0480e5297ffd
+        imagePullPolicy: Always
+        name: istio-proxy
+        ports:
+        - containerPort: 15090
+          name: http-envoy-prom
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 30
+          httpGet:
+            path: /healthz/ready
+            port: 15020
+            scheme: HTTP
+          initialDelaySeconds: 1
+          periodSeconds: 2
+          successThreshold: 1
+          timeoutSeconds: 1
+        volumeMounts:
+        - mountPath: /var/run/secrets/istio
+          name: istiod-ca-cert
+        - mountPath: /etc/istio/proxy
+          name: istio-envoy
+        - mountPath: /var/run/secrets/tokens
+          name: istio-token
+        - mountPath: /etc/istio-certs/
+          name: istio-certs
+        - mountPath: /etc/istio/config
+          name: istio-config-volume
+      serviceAccountName: prometheus
+      volumes:
+      - configMap:
+          name: istio
+          optional: true
+        name: istio-config-volume
+      - configMap:
+          name: prometheus
+        name: config-volume
+      - emptyDir:
+          medium: Memory
+        name: istio-certs
+      - emptyDir:
+          medium: Memory
+        name: istio-envoy
+      - name: istio-token
+        projected:
+          defaultMode: 420
+          sources:
+          - serviceAccountToken:
+              audience: istio-ca
+              expirationSeconds: 43200
+              path: istio-token
+      - configMap:
+          defaultMode: 420
+          name: istio-ca-root-cert
+        name: istiod-ca-cert
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    prometheus.io/scrape: "true"
+  labels:
+    app: prometheus
+    cloudfoundry.org/istio_version: 1.6.9
+    release: istio
+  name: prometheus
+  namespace: istio-system
+spec:
+  ports:
+  - name: http-prometheus
+    port: 9090
+    protocol: TCP
+  selector:
+    app: prometheus
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app: prometheus
+    cloudfoundry.org/istio_version: 1.6.9
+    release: istio
+  name: prometheus
+  namespace: istio-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
     app: istiod
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     release: istio
   name: istiod-istio-system
 rules:
@@ -165,7 +725,7 @@ kind: ClusterRole
 metadata:
   labels:
     app: istio-reader
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     release: istio
   name: istio-reader-istio-system
 rules:
@@ -208,7 +768,7 @@ kind: ClusterRoleBinding
 metadata:
   labels:
     app: istio-reader
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     release: istio
   name: istio-reader-istio-system
 roleRef:
@@ -225,7 +785,7 @@ kind: ClusterRoleBinding
 metadata:
   labels:
     app: pilot
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     release: istio
   name: istiod-pilot-istio-system
 roleRef:
@@ -242,7 +802,7 @@ kind: ServiceAccount
 metadata:
   labels:
     app: istio-reader
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     release: istio
   name: istio-reader-service-account
   namespace: istio-system
@@ -252,7 +812,7 @@ kind: ServiceAccount
 metadata:
   labels:
     app: istiod
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     release: istio
   name: istiod-service-account
   namespace: istio-system
@@ -262,7 +822,7 @@ kind: ValidatingWebhookConfiguration
 metadata:
   labels:
     app: istiod
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio: istiod
     release: istio
   name: istiod-istio-system
@@ -297,9 +857,130 @@ metadata:
   annotations:
     helm.sh/resource-policy: keep
   labels:
+    app: mixer
+    chart: istio
+    cloudfoundry.org/istio_version: 1.6.9
+    heritage: Tiller
+    istio: mixer-adapter
+    package: adapter
+    release: istio
+  name: adapters.config.istio.io
+spec:
+  group: config.istio.io
+  names:
+    categories:
+    - istio-io
+    - policy-istio-io
+    kind: adapter
+    plural: adapters
+    singular: adapter
+  scope: Namespaced
+  subresources:
+    status: {}
+  versions:
+  - name: v1alpha2
+    served: true
+    storage: true
+---
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    app: mixer
+    chart: istio
+    cloudfoundry.org/istio_version: 1.6.9
+    heritage: Tiller
+    istio: mixer-template
+    package: template
+    release: istio
+  name: templates.config.istio.io
+spec:
+  group: config.istio.io
+  names:
+    categories:
+    - istio-io
+    - policy-istio-io
+    kind: template
+    plural: templates
+    singular: template
+  scope: Namespaced
+  subresources:
+    status: {}
+  versions:
+  - name: v1alpha2
+    served: true
+    storage: true
+---
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  labels:
+    cloudfoundry.org/istio_version: 1.6.9
+    release: istio
+  name: istiooperators.install.istio.io
+spec:
+  additionalPrinterColumns:
+  - JSONPath: .spec.revision
+    description: Istio control plane revision
+    name: Revision
+    type: string
+  - JSONPath: .metadata.creationTimestamp
+    description: 'CreationTimestamp is a timestamp representing the server time when
+      this object was created. It is not guaranteed to be set in happens-before order
+      across separate operations. Clients may not set this value. It is represented
+      in RFC3339 form and is in UTC. Populated by the system. Read-only. Null for
+      lists. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#metadata'
+    name: Age
+    type: date
+  group: install.istio.io
+  names:
+    kind: IstioOperator
+    plural: istiooperators
+    shortNames:
+    - iop
+    singular: istiooperator
+  scope: Namespaced
+  subresources:
+    status: {}
+  validation:
+    openAPIV3Schema:
+      properties:
+        apiVersion:
+          description: 'APIVersion defines the versioned schema of this representation
+            of an object. Servers should convert recognized schemas to the latest
+            internal value, and may reject unrecognized values. More info: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#resources'
+          type: string
+        kind:
+          description: 'Kind is a string value representing the REST resource this
+            object represents. Servers may infer this from the endpoint the client
+            submits requests to. Cannot be updated. In CamelCase. More info: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+          type: string
+        spec:
+          description: 'Specification of the desired state of the istio control plane
+            resource. More info: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#spec-and-status'
+          type: object
+        status:
+          description: 'Status describes each of istio control plane component status
+            at the current time. 0 means NONE, 1 means UPDATING, 2 means HEALTHY,
+            3 means ERROR, 4 means RECONCILING. More info: https://github.com/istio/api/blob/master/operator/v1alpha1/istio.operator.v1alpha1.pb.html
+            & https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#spec-and-status'
+          type: object
+  versions:
+  - name: v1alpha1
+    served: true
+    storage: true
+---
+apiVersion: apiextensions.k8s.io/v1beta1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
     app: istio-mixer
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     release: istio
   name: httpapispecs.config.istio.io
@@ -572,7 +1253,7 @@ metadata:
   labels:
     app: istio-mixer
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     release: istio
   name: httpapispecbindings.config.istio.io
@@ -669,7 +1350,7 @@ metadata:
   labels:
     app: istio-mixer
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     release: istio
   name: quotaspecs.config.istio.io
@@ -766,7 +1447,7 @@ metadata:
   labels:
     app: istio-mixer
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     release: istio
   name: quotaspecbindings.config.istio.io
@@ -850,7 +1531,7 @@ metadata:
   labels:
     app: istio-pilot
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     release: istio
   name: destinationrules.networking.istio.io
@@ -1990,7 +2671,7 @@ metadata:
   labels:
     app: istio-pilot
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     release: istio
   name: envoyfilters.networking.istio.io
@@ -2227,7 +2908,7 @@ metadata:
   labels:
     app: istio-pilot
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     release: istio
   name: gateways.networking.istio.io
@@ -2382,7 +3063,7 @@ metadata:
   labels:
     app: istio-pilot
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     release: istio
   name: serviceentries.networking.istio.io
@@ -2546,7 +3227,7 @@ metadata:
   labels:
     app: istio-pilot
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     release: istio
   name: sidecars.networking.istio.io
@@ -2894,7 +3575,7 @@ metadata:
   labels:
     app: istio-pilot
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     release: istio
   name: virtualservices.networking.istio.io
@@ -3709,7 +4390,7 @@ metadata:
   labels:
     app: istio-pilot
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     release: istio
   name: workloadentries.networking.istio.io
@@ -3797,7 +4478,7 @@ metadata:
   labels:
     app: mixer
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     istio: core
     package: istio.io.mixer
@@ -3877,7 +4558,7 @@ metadata:
   labels:
     app: mixer
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     istio: mixer-handler
     package: handler
@@ -4087,7 +4768,7 @@ metadata:
   labels:
     app: mixer
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     istio: mixer-instance
     package: instance
@@ -4152,7 +4833,7 @@ metadata:
   labels:
     app: mixer
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     istio: core
     package: istio.io.mixer
@@ -4311,7 +4992,7 @@ metadata:
   labels:
     app: istio-pilot
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     istio: rbac
     release: istio
@@ -4401,7 +5082,7 @@ metadata:
   labels:
     app: mixer
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     istio: rbac
     package: istio.io.mixer
@@ -4492,7 +5173,7 @@ metadata:
   labels:
     app: mixer
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     istio: rbac
     package: istio.io.mixer
@@ -4606,7 +5287,7 @@ metadata:
   labels:
     app: mixer
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     istio: rbac
     package: istio.io.mixer
@@ -4811,7 +5492,7 @@ metadata:
   labels:
     app: istio-pilot
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     istio: security
     release: istio
@@ -5014,7 +5695,7 @@ metadata:
   labels:
     app: istio-pilot
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     istio: security
     release: istio
@@ -5096,7 +5777,7 @@ metadata:
   labels:
     app: istio-pilot
     chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     heritage: Tiller
     istio: security
     release: istio
@@ -5199,172 +5880,56 @@ spec:
     served: true
     storage: true
 ---
-apiVersion: apiextensions.k8s.io/v1beta1
-kind: CustomResourceDefinition
-metadata:
-  annotations:
-    helm.sh/resource-policy: keep
-  labels:
-    app: mixer
-    chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
-    heritage: Tiller
-    istio: mixer-adapter
-    package: adapter
-    release: istio
-  name: adapters.config.istio.io
-spec:
-  group: config.istio.io
-  names:
-    categories:
-    - istio-io
-    - policy-istio-io
-    kind: adapter
-    plural: adapters
-    singular: adapter
-  scope: Namespaced
-  subresources:
-    status: {}
-  versions:
-  - name: v1alpha2
-    served: true
-    storage: true
----
-apiVersion: apiextensions.k8s.io/v1beta1
-kind: CustomResourceDefinition
-metadata:
-  annotations:
-    helm.sh/resource-policy: keep
-  labels:
-    app: mixer
-    chart: istio
-    cloudfoundry.org/istio_version: 1.6.4
-    heritage: Tiller
-    istio: mixer-template
-    package: template
-    release: istio
-  name: templates.config.istio.io
-spec:
-  group: config.istio.io
-  names:
-    categories:
-    - istio-io
-    - policy-istio-io
-    kind: template
-    plural: templates
-    singular: template
-  scope: Namespaced
-  subresources:
-    status: {}
-  versions:
-  - name: v1alpha2
-    served: true
-    storage: true
----
-apiVersion: apiextensions.k8s.io/v1beta1
-kind: CustomResourceDefinition
-metadata:
-  labels:
-    cloudfoundry.org/istio_version: 1.6.4
-    release: istio
-  name: istiooperators.install.istio.io
-spec:
-  additionalPrinterColumns:
-  - JSONPath: .spec.revision
-    description: Istio control plane revision
-    name: Revision
-    type: string
-  - JSONPath: .metadata.creationTimestamp
-    description: 'CreationTimestamp is a timestamp representing the server time when
-      this object was created. It is not guaranteed to be set in happens-before order
-      across separate operations. Clients may not set this value. It is represented
-      in RFC3339 form and is in UTC. Populated by the system. Read-only. Null for
-      lists. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#metadata'
-    name: Age
-    type: date
-  group: install.istio.io
-  names:
-    kind: IstioOperator
-    plural: istiooperators
-    shortNames:
-    - iop
-    singular: istiooperator
-  scope: Namespaced
-  subresources:
-    status: {}
-  validation:
-    openAPIV3Schema:
-      properties:
-        apiVersion:
-          description: 'APIVersion defines the versioned schema of this representation
-            of an object. Servers should convert recognized schemas to the latest
-            internal value, and may reject unrecognized values. More info: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#resources'
-          type: string
-        kind:
-          description: 'Kind is a string value representing the REST resource this
-            object represents. Servers may infer this from the endpoint the client
-            submits requests to. Cannot be updated. In CamelCase. More info: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
-          type: string
-        spec:
-          description: 'Specification of the desired state of the istio control plane
-            resource. More info: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#spec-and-status'
-          type: object
-        status:
-          description: 'Status describes each of istio control plane component status
-            at the current time. 0 means NONE, 1 means UPDATING, 2 means HEALTHY,
-            3 means ERROR, 4 means RECONCILING. More info: https://github.com/istio/api/blob/master/operator/v1alpha1/istio.operator.v1alpha1.pb.html
-            & https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#spec-and-status'
-          type: object
-  versions:
-  - name: v1alpha1
-    served: true
-    storage: true
----
 apiVersion: autoscaling/v2beta1
 kind: HorizontalPodAutoscaler
 metadata:
   labels:
     app: istio-ingressgateway
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio: ingressgateway
     release: istio
   name: istio-ingressgateway
   namespace: istio-system
 spec:
-  maxReplicas: 1
+  maxReplicas: 10
   metrics:
   - resource:
       name: cpu
       targetAverageUtilization: 80
     type: Resource
-  minReplicas: 1
+  minReplicas: 10
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: istio-ingressgateway
 ---
 apiVersion: apps/v1
-kind: DaemonSet
+kind: Deployment
 metadata:
   annotations:
     kbld.k14s.io/images: |
       - Metas:
-        - Tag: 1.6.4
+        - Tag: 1.6.9
           Type: resolved
-          URL: gcr.io/cf-routing/proxyv2:1.6.4
-        URL: gcr.io/cf-routing/proxyv2@sha256:4e4d05059e65080b158a347bcfac67090968e96f302dea54c0efac9a16ef62f0
+          URL: gcr.io/cf-routing/proxyv2:1.6.9
+        URL: gcr.io/cf-routing/proxyv2@sha256:7ab643e8d1765c6385a3fb3dbab0055f99894256ef2c4d29584b0480e5297ffd
   labels:
     app: istio-ingressgateway
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio: ingressgateway
     release: istio
   name: istio-ingressgateway
   namespace: istio-system
 spec:
+  replicas: 10
   selector:
     matchLabels:
       app: istio-ingressgateway
       istio: ingressgateway
+  strategy:
+    rollingUpdate:
+      maxSurge: 100%
+      maxUnavailable: 25%
   template:
     metadata:
       annotations:
@@ -5372,7 +5937,7 @@ spec:
       labels:
         app: istio-ingressgateway
         chart: gateways
-        cloudfoundry.org/istio_version: 1.6.4
+        cloudfoundry.org/istio_version: 1.6.9
         heritage: Tiller
         istio: ingressgateway
         release: istio
@@ -5480,7 +6045,7 @@ spec:
           value: Kubernetes
         - name: TERMINATION_DRAIN_DURATION_SECONDS
           value: "60"
-        image: gcr.io/cf-routing/proxyv2@sha256:4e4d05059e65080b158a347bcfac67090968e96f302dea54c0efac9a16ef62f0
+        image: gcr.io/cf-routing/proxyv2@sha256:7ab643e8d1765c6385a3fb3dbab0055f99894256ef2c4d29584b0480e5297ffd
         lifecycle:
           preStop:
             exec:
@@ -5492,9 +6057,7 @@ spec:
         ports:
         - containerPort: 15021
         - containerPort: 8080
-          hostPort: 80
         - containerPort: 8443
-          hostPort: 443
         - containerPort: 15443
         - containerPort: 15011
         - containerPort: 15012
@@ -5515,11 +6078,11 @@ spec:
           timeoutSeconds: 1
         resources:
           limits:
-            cpu: 2000m
-            memory: 1024Mi
+            cpu: "4"
+            memory: 2Gi
           requests:
-            cpu: 100m
-            memory: 128Mi
+            cpu: "2"
+            memory: 1Gi
         volumeMounts:
         - mountPath: /etc/istio/proxy
           name: istio-envoy
@@ -5604,9 +6167,6 @@ spec:
       - hostPath:
           path: /var/lib/docker/containers
         name: dockercontainers
-  updateStrategy:
-    rollingUpdate:
-      maxUnavailable: 1
 ---
 apiVersion: policy/v1beta1
 kind: PodDisruptionBudget
@@ -5615,7 +6175,7 @@ metadata:
     kapp.k14s.io/update-strategy: fallback-on-replace
   labels:
     app: istio-ingressgateway
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio: ingressgateway
     release: istio
   name: istio-ingressgateway
@@ -5632,7 +6192,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     release: istio
   name: istio-ingressgateway-sds
   namespace: istio-system
@@ -5650,7 +6210,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     release: istio
   name: istio-ingressgateway-sds
   namespace: istio-system
@@ -5668,7 +6228,7 @@ metadata:
   annotations: null
   labels:
     app: istio-ingressgateway
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio: ingressgateway
     release: istio
   name: istio-ingressgateway
@@ -5698,7 +6258,7 @@ kind: ServiceAccount
 metadata:
   labels:
     app: istio-ingressgateway
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio: ingressgateway
     release: istio
   name: istio-ingressgateway-service-account
@@ -5709,19 +6269,19 @@ kind: HorizontalPodAutoscaler
 metadata:
   labels:
     app: istiod
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
     release: istio
   name: istiod
   namespace: istio-system
 spec:
-  maxReplicas: 1
+  maxReplicas: 10
   metrics:
   - resource:
       name: cpu
       targetAverageUtilization: 80
     type: Resource
-  minReplicas: 1
+  minReplicas: 10
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
@@ -5799,7 +6359,7 @@ data:
 kind: ConfigMap
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
     release: istio
   name: istio
@@ -5811,19 +6371,20 @@ metadata:
   annotations:
     kbld.k14s.io/images: |
       - Metas:
-        - Tag: 1.6.4
+        - Tag: 1.6.9
           Type: resolved
-          URL: gcr.io/cf-routing/pilot:1.6.4
-        URL: gcr.io/cf-routing/pilot@sha256:0516ef03cc2fb03e0202c7d08e73ffc761caad6946b664bd9ad1814020462c09
+          URL: gcr.io/cf-routing/pilot:1.6.9
+        URL: gcr.io/cf-routing/pilot@sha256:9247bb8a74c9e17e9e2294bcd1b141bde1e06bc27fd13754e41cd8ed0516ea05
   labels:
     app: istiod
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio: pilot
     istio.io/rev: default
     release: istio
   name: istiod
   namespace: istio-system
 spec:
+  replicas: 10
   selector:
     matchLabels:
       istio: pilot
@@ -5837,7 +6398,7 @@ spec:
         sidecar.istio.io/inject: "false"
       labels:
         app: istiod
-        cloudfoundry.org/istio_version: 1.6.4
+        cloudfoundry.org/istio_version: 1.6.9
         istio: pilot
         istio.io/rev: default
     spec:
@@ -5889,7 +6450,7 @@ spec:
           value: Kubernetes
         - name: CENTRAL_ISTIOD
           value: "false"
-        image: gcr.io/cf-routing/pilot@sha256:0516ef03cc2fb03e0202c7d08e73ffc761caad6946b664bd9ad1814020462c09
+        image: gcr.io/cf-routing/pilot@sha256:9247bb8a74c9e17e9e2294bcd1b141bde1e06bc27fd13754e41cd8ed0516ea05
         name: discovery
         ports:
         - containerPort: 8080
@@ -5995,7 +6556,11 @@ data:
         - "-b"
         - "{{ annotation .ObjectMeta `traffic.sidecar.istio.io/includeInboundPorts` `*` }}"
         - "-d"
+        {{- if excludeInboundPort (annotation .ObjectMeta `status.sidecar.istio.io/port` .Values.global.proxy.statusPort) (annotation .ObjectMeta `traffic.sidecar.istio.io/excludeInboundPorts` .Values.global.proxy.excludeInboundPorts) }}
         - "15090,15021,{{ excludeInboundPort (annotation .ObjectMeta `status.sidecar.istio.io/port` .Values.global.proxy.statusPort) (annotation .ObjectMeta `traffic.sidecar.istio.io/excludeInboundPorts` .Values.global.proxy.excludeInboundPorts) }}"
+        {{- else }}
+        - "15090,15021"
+        {{- end }}
         {{ if or (isset .ObjectMeta.Annotations `traffic.sidecar.istio.io/excludeOutboundPorts`) (ne (valueOrDefault .Values.global.proxy.excludeOutboundPorts "") "") -}}
         - "-o"
         - "{{ annotation .ObjectMeta `traffic.sidecar.istio.io/excludeOutboundPorts` .Values.global.proxy.excludeOutboundPorts }}"
@@ -6169,13 +6734,7 @@ data:
             {{- end}}
             ]
         - name: ISTIO_META_APP_CONTAINERS
-          value: |-
-            [
-              {{- range $index, $container := .Spec.Containers }}
-                {{- if ne $index 0}},{{- end}}
-                {{ $container.Name }}
-              {{- end}}
-            ]
+          value: "{{- range $index, $container := .Spec.Containers }}{{- if ne $index 0}},{{- end}}{{ $container.Name }}{{- end}}"
         - name: ISTIO_META_CLUSTER_ID
           value: "{{ valueOrDefault .Values.global.multiCluster.clusterName `Kubernetes` }}"
         - name: ISTIO_META_INTERCEPTION_MODE
@@ -6511,7 +7070,7 @@ data:
         "sts": {
           "servicePort": 0
         },
-        "tag": "1.6.4",
+        "tag": "1.6.9",
         "telemetryNamespace": "istio-system",
         "tracer": {
           "datadog": {
@@ -6556,7 +7115,7 @@ data:
 kind: ConfigMap
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
     release: istio
   name: istio-sidecar-injector
@@ -6567,7 +7126,7 @@ kind: MutatingWebhookConfiguration
 metadata:
   labels:
     app: sidecar-injector
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
     release: istio
   name: istio-sidecar-injector
@@ -6600,7 +7159,7 @@ metadata:
     kapp.k14s.io/update-strategy: fallback-on-replace
   labels:
     app: istiod
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio: pilot
     istio.io/rev: default
     release: istio
@@ -6618,7 +7177,7 @@ kind: Service
 metadata:
   labels:
     app: istiod
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio: pilot
     istio.io/rev: default
     release: istio
@@ -6635,10 +7194,6 @@ spec:
     targetPort: 15017
   - name: http-monitoring
     port: 15014
-  - name: dns
-    port: 53
-    protocol: UDP
-    targetPort: 15053
   - name: dns-tls
     port: 853
     protocol: TCP
@@ -6651,7 +7206,7 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
   name: metadata-exchange-1.4
   namespace: istio-system
@@ -6682,7 +7237,7 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
   name: stats-filter-1.4
   namespace: istio-system
@@ -6778,7 +7333,7 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
   name: metadata-exchange-1.5
   namespace: istio-system
@@ -6813,7 +7368,7 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
   name: tcp-metadata-exchange-1.5
   namespace: istio-system
@@ -6868,7 +7423,7 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
   name: stats-filter-1.5
   namespace: istio-system
@@ -6976,7 +7531,7 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
   name: tcp-stats-filter-1.5
   namespace: istio-system
@@ -7077,7 +7632,7 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
   name: metadata-exchange-1.6
   namespace: istio-system
@@ -7113,7 +7668,7 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
   name: tcp-metadata-exchange-1.6
   namespace: istio-system
@@ -7171,7 +7726,7 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
   name: stats-filter-1.6
   namespace: istio-system
@@ -7279,7 +7834,7 @@ apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
     istio.io/rev: default
   name: tcp-stats-filter-1.6
   namespace: istio-system
@@ -7380,14 +7935,14 @@ apiVersion: v1
 kind: Namespace
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
   name: istio-system
 ---
 apiVersion: security.istio.io/v1beta1
 kind: PeerAuthentication
 metadata:
   labels:
-    cloudfoundry.org/istio_version: 1.6.4
+    cloudfoundry.org/istio_version: 1.6.9
   name: default
   namespace: istio-system
 spec:

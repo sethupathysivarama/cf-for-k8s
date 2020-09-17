@@ -6,14 +6,23 @@ spec:
   profile: default
   namespace: istio-system
   components:
+    telemetry:
+      enabled: false
     ingressGateways:
       - name: istio-ingressgateway
         enabled: true
         k8s:
+          overlays:
+          - kind: Deployment
+            name: istio-ingressgateway
+            patches:
+              - path: spec.replicas
+                value: 10
           hpaSpec:
-            minReplicas: 1
-            maxReplicas: 1
+            minReplicas: 10
+            maxReplicas: 10
           service:
+            type: LoadBalancer
             externalTrafficPolicy: Local
             ports: # TODO: remove when https://github.com/istio/istio/issues/24432 fixed
             - name: status-port
@@ -28,14 +37,30 @@ spec:
             - name: tls
               port: 15443
               targetPort: 15443
+          resources:
+            limits:
+              cpu: "4"
+              memory: 2Gi
+            requests:
+              cpu: "2"
+              memory: 1Gi
     pilot:
       k8s:
+        replicaCount: 10
+        overlays:
+          - kind: Deployment
+            name: istiod
+            patches:
+              - path: spec.replicas
+                value: 10
         hpaSpec:
-          minReplicas: 1
-          maxReplicas: 1
+          minReplicas: 10
+          maxReplicas: 10
   values:
-    prometheus:
-      enabled: false
+    telemetry:
+      enabled: true
+      v2:
+        enabled: true
     sidecarInjectorWebhook:
       rewriteAppHTTPProbe: true
     meshConfig:
