@@ -115,15 +115,6 @@ stringData:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: cloud-controller-username-lookup-client-secret
-  namespace: #@ system_namespace()
-type: Opaque
-stringData:
-  password: #@ data.values.capi.cc_username_lookup_client_secret
----
-apiVersion: v1
-kind: Secret
-metadata:
   name: capi-database-encryption-key-secret
   namespace: #@ system_namespace()
 type: Opaque
