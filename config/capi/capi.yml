@@ -102,21 +102,3 @@ metadata:
 type: Opaque
 stringData:
   password: #@ data.values.blobstore.secret_access_key
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: cf-api-controllers-client-secret
-  namespace: #@ system_namespace()
-type: Opaque
-stringData:
-  password: #@ data.values.capi.cf_api_controllers_client_secret
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: capi-database-encryption-key-secret
-  namespace: #@ system_namespace()
-type: Opaque
-stringData:
-  password: #@ data.values.capi.database.encryption_key

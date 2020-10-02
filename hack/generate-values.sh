@@ -95,8 +95,6 @@ variables:
   type: password
 - name: capi_db_password
   type: password
-- name: capi_db_encryption_key
-  type: password
 - name: uaa_db_password
   type: password
 - name: uaa_login_secret
@@ -104,8 +102,6 @@ variables:
 - name: uaa_admin_client_secret
   type: password
 - name: uaa_encryption_key_passphrase
-  type: password
-- name: cf_api_controllers_client_secret
   type: password
 - name: default_ca
   type: certificate
@@ -169,10 +165,8 @@ cf_db:
   admin_password: $(bosh interpolate ${VARS_FILE} --path=/db_admin_password)
 
 capi:
-  cf_api_controllers_client_secret: $(bosh interpolate ${VARS_FILE} --path=/cf_api_controllers_client_secret)
   database:
     password: $(bosh interpolate ${VARS_FILE} --path=/capi_db_password)
-    encryption_key: $(bosh interpolate ${VARS_FILE} --path=/capi_db_encryption_key)
 
 system_certificate:
   #! This certificates and keys should be valid for *.system.cf.example.com
