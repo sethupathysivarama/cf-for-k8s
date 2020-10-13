@@ -1,4 +1,4 @@
-load("@ytt:assert", "assert")
+load("/testing_library.star", "assert_equals")
 load("gateway.lib.yml", "gateway")
 
 def test_gateway_when_app_domain_equals_system_domain():
